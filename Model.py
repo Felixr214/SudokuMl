@@ -52,16 +52,11 @@ class SudokuTransformer(nn.Module):
         """
         batch_size = x.size(0)
 
-        # Flatten (B, 9, 9) to (B, 81)
+        # embedding
+
         x_flat = x.view(batch_size, 81)
-
-        # Compute value embeddings -> (B, 81, d_model)
         val_e = self.val_embed(x_flat)
-
-        # Compute spatial embeddings -> (81, d_model)
         pos_e = self.row_embed(self.rows) + self.col_embed(self.cols) + self.box_embed(self.boxes)
-
-        # Combine value and spatial embeddings
         h = val_e + pos_e.unsqueeze(0)  # (B, 81, d_model)
 
         # Pass through Transformer Stack

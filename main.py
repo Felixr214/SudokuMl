@@ -1,12 +1,15 @@
 import time
-import numpy as np
 import torch
 import torch.nn as nn
 from Dataset import get_sudoku_dataloaders
 from Model import SudokuTransformer
 
 
-def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch):
+def train_one_epoch(model, train_loader, optimizer, criterion, scaler, device, epoch, accum_steps=1):
+    """
+    Trains the SudokuTransformer for one epoch using masked CrossEntropyLoss,
+    Intel XPU Automatic Mixed Precision (AMP), and gradient accumulation.
+    """
     model.train()
 
     running_loss = 0.0
@@ -18,33 +21,51 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch):
     start_time = time.time()
     total_batches = len(train_loader)
 
+    optimizer.zero_grad(set_to_none=True)
+
     for batch_idx, (puzzles, targets) in enumerate(train_loader):
         puzzles = puzzles.to(device, non_blocking=True)
-        targets = targets.to(device, non_blocking=True)  # Targets expected shape (B, 9, 9) with values 0-8
+        targets = targets.to(device, non_blocking=True)
 
-        optimizer.zero_grad()
+        # 1. Mask for unfilled/empty cells (where input puzzle is 0)
+        empty_mask = (puzzles == 0)
 
-        # Forward pass: shape (B, 9, 9, 9)
-        logits = model(puzzles)
+        # 2. Intel XPU Mixed Precision Forward Pass
+        with torch.amp.autocast("xpu", dtype=torch.bfloat16):
+            logits = model(puzzles)  # Shape: (B, 9, 9, 9)
 
-        # CrossEntropyLoss over all 81 cells concurrently
-        loss = criterion(logits.view(-1, 9), targets.view(-1))
+            # Flatten tensors for CrossEntropyLoss
+            flat_logits = logits.view(-1, 9)
+            flat_targets = targets.view(-1)
+            flat_mask = empty_mask.view(-1)
 
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+            # Compute loss ONLY on empty/missing cells
+            loss = criterion(flat_logits[flat_mask], flat_targets[flat_mask])
+            loss = loss / accum_steps
 
-        # Metrics accumulation
-        running_loss += loss.item()
+        # 3. Scaled Backward Pass
+        scaler.scale(loss).backward()
 
+        # 4. Gradient Accumulation & Optimizer Step
+        if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == total_batches:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        # Accumulate unscaled loss for logging
+        running_loss += loss.item() * accum_steps
+
+        # 5. Fast Metrics Calculation
         with torch.no_grad():
             preds = torch.argmax(logits, dim=-1)  # Shape: (B, 9, 9)
 
-            # 1. Cell-level accuracy
-            correct_cells += (preds == targets).sum().item()
-            total_cells += targets.numel()
+            # Accuracy on missing cells only
+            correct_cells += ((preds == targets) & empty_mask).sum().item()
+            total_cells += empty_mask.sum().item()
 
-            # 2. Exact full-board solve accuracy (all 81 cells correct)
+            # Exact full-board solve accuracy (all 81 cells correct)
             board_correct = (preds == targets).view(puzzles.size(0), -1).all(dim=1)
             exact_board_matches += board_correct.sum().item()
             total_boards += puzzles.size(0)
@@ -52,24 +73,24 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch):
         # Print progress every 200 batches
         if (batch_idx + 1) % 200 == 0 or (batch_idx + 1) == total_batches:
             avg_loss = running_loss / (batch_idx + 1)
-            cell_acc = 100.0 * correct_cells / total_cells
+            cell_acc = (100.0 * correct_cells / total_cells) if total_cells > 0 else 0.0
             board_acc = 100.0 * exact_board_matches / total_boards
 
             print(
                 f"Epoch [{epoch:02d}] | Batch [{batch_idx + 1:04d}/{total_batches}] | "
                 f"Train Loss: {avg_loss:.4f} | "
-                f"Cell Acc: {cell_acc:.2f}% | "
+                f"Cell Acc (Empty Only): {cell_acc:.2f}% | "
                 f"Exact Board Acc: {board_acc:.2f}%"
             )
 
     elapsed = time.time() - start_time
     epoch_loss = running_loss / total_batches
-    epoch_cell_acc = 100.0 * correct_cells / total_cells
+    epoch_cell_acc = (100.0 * correct_cells / total_cells) if total_cells > 0 else 0.0
     epoch_board_acc = 100.0 * exact_board_matches / total_boards
 
     print(
         f"--> Epoch [{epoch:02d}] Finished in {elapsed:.1f}s | "
-        f"Avg Train Loss: {epoch_loss:.4f} | "
+        f"Avg Loss: {epoch_loss:.4f} | "
         f"Cell Acc: {epoch_cell_acc:.2f}% | "
         f"Board Acc: {epoch_board_acc:.2f}%\n"
     )
@@ -151,9 +172,18 @@ def main():
     # Model, Optimizer, Scheduler, Criterion
     model = SudokuTransformer(d_model=256, nhead=8, num_layers=6).to(device)
 
+    # Compile model for Intel XPU acceleration
+    try:
+        # PyTorch 2.1+ natively supports inductor/openxla backends for XPU
+        model = torch.compile(model, backend="inductor")
+        print("--> Model successfully compiled with torch.compile!")
+    except Exception as e:
+        print(f"--> Warning: torch.compile failed on XPU ({e}). Continuing with eager mode.")
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-2)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
     criterion = nn.CrossEntropyLoss()
+    scaler = torch.amp.GradScaler("xpu")
 
     best_val_acc = 0.0
 
@@ -162,7 +192,7 @@ def main():
     for epoch in range(1, num_epochs + 1):
         # 1. Train step
         train_loss, train_cell_acc, train_board_acc = train_one_epoch(
-            model, train_loader, optimizer, criterion, device, epoch
+            model, train_loader, optimizer, criterion, scaler, device, epoch
         )
 
         # 2. Validation step
